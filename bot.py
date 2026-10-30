@@ -5,6 +5,9 @@ import json
 import logging
 import os
 import random
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 from datetime import timedelta, timezone
@@ -39,6 +42,9 @@ FEED_SECONDS = int(os.getenv("FEED_SECONDS", "25"))
 FULL_SCAN_SECONDS = int(os.getenv("FULL_SCAN_SECONDS", "60"))
 # priority accounts (/priority user) are re-checked this often
 PRIO_SECONDS = int(os.getenv("PRIO_SECONDS", "90"))
+
+# put the Instagram cover as the 1st frame of every video (needs ffmpeg) so Telegram shows it as preview
+COVER_FRAME = os.getenv("COVER_FRAME", "1") == "1"
 
 SESSION_FILE = "session.json"
 DATA_FILE = "data.json"
@@ -177,8 +183,70 @@ def make_thumb(raw):
         buf = io.BytesIO()
         im.save(buf, "JPEG", quality=80)
         return buf.getvalue(), w, h
-    except Exception:
+    except Exception as e:
+        log.warning("make_thumb failed: %s", e)
         return None, 0, 0
+
+
+def embed_cover_bytes(video, cover):
+    """Re-encode video with the cover image as its very first frame. Returns bytes or None."""
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        log.warning("ffmpeg/ffprobe not installed -> cover frame skipped")
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            vp, cp, op = (os.path.join(d, n) for n in ("in.mp4", "cover.jpg", "out.mp4"))
+            with open(vp, "wb") as f:
+                f.write(video)
+            Image.open(io.BytesIO(cover)).convert("RGB").save(cp, "JPEG", quality=92)
+
+            pr = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,r_frame_rate",
+                 "-of", "csv=p=0", vp],
+                capture_output=True, text=True, timeout=30,
+            )
+            w_s, h_s, fr_s = pr.stdout.strip().split("\n")[0].split(",")[:3]
+            width, height = int(w_s), int(h_s)
+            num, _, den = fr_s.partition("/")
+            fps = float(num) / float(den or 1)
+            if not (1 <= fps <= 120):
+                fps = 30.0
+            width -= width % 2
+            height -= height % 2
+            frame_len = 1.0 / fps
+            delay_ms = max(1, int(round(frame_len * 1000)))
+
+            has_audio = bool(subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_type", "-of", "csv=p=0", vp],
+                capture_output=True, text=True, timeout=30,
+            ).stdout.strip())
+
+            fc = (
+                f"[1:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps:.3f},format=yuv420p[c];"
+                f"[0:v]scale={width}:{height},setsar=1,fps={fps:.3f},format=yuv420p[v];"
+                f"[c][v]concat=n=2:v=1:a=0[outv]"
+            )
+            args = ["ffmpeg", "-y", "-loglevel", "error", "-i", vp, "-loop", "1",
+                    "-framerate", f"{fps:.3f}", "-t", f"{frame_len:.4f}", "-i", cp]
+            if has_audio:
+                fc += f";[0:a]adelay={delay_ms}|{delay_ms}[outa]"
+                args += ["-filter_complex", fc, "-map", "[outv]", "-map", "[outa]"]
+            else:
+                args += ["-filter_complex", fc, "-map", "[outv]"]
+            args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p"]
+            if has_audio:
+                args += ["-c:a", "aac", "-b:a", "128k"]
+            args += ["-movflags", "+faststart", op]
+            subprocess.run(args, check=True, capture_output=True, timeout=240)
+            with open(op, "rb") as f:
+                out = f.read()
+            return out or None
+    except Exception as e:
+        log.warning("cover-first-frame failed: %s", e)
+        return None
 
 
 def vid_kwargs(b):
@@ -211,11 +279,24 @@ async def send_media(bot, items, caption):
                     "h": 0,
                 }
                 if it["kind"] == "video" and it.get("thumb"):
+                    cover_raw = None
                     try:
                         tr = await h.get(it["thumb"])
-                        b["thumb"], b["w"], b["h"] = make_thumb(tr.content)
-                    except Exception:
-                        pass
+                        tr.raise_for_status()
+                        cover_raw = tr.content
+                        b["thumb"], b["w"], b["h"] = make_thumb(cover_raw)
+                    except Exception as e:
+                        log.warning("thumbnail download failed: %s", e)
+                    if not b["thumb"]:
+                        log.warning("video sent WITHOUT thumbnail")
+                    if COVER_FRAME and cover_raw:
+                        framed = await asyncio.to_thread(
+                            embed_cover_bytes, b["data"], cover_raw
+                        )
+                        if framed and len(framed) <= TG_FILE_LIMIT:
+                            b["data"] = framed
+                        else:
+                            log.warning("sending original video (no cover frame)")
                 blobs.append(b)
         if not blobs:
             raise ValueError("no media")
