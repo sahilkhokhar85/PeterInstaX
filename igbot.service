@@ -1,0 +1,12 @@
+[Unit]
+Description=Instagram to Telegram bot
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/insta-tg-bot
+ExecStart=/opt/insta-tg-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
