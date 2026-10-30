@@ -1,14 +1,18 @@
 import asyncio
+import html
+import io
 import json
 import logging
 import os
 import random
 import threading
 import time
+from datetime import timedelta, timezone
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
+from PIL import Image
 from instagrapi import Client
 from instagrapi.exceptions import (
     LoginRequired,
@@ -129,53 +133,135 @@ def ig_following():
 
 
 def media_items(m):
-    """list of (kind, url) for a post/reel/story"""
+    """list of dicts describing the media of a post/reel/story"""
     out = []
     if getattr(m, "media_type", 1) == 8:
         for r in m.resources:
             if r.media_type == 2 and r.video_url:
-                out.append(("video", str(r.video_url)))
+                out.append(
+                    {
+                        "kind": "video",
+                        "url": str(r.video_url),
+                        "thumb": str(r.thumbnail_url) if r.thumbnail_url else None,
+                        "dur": 0,
+                    }
+                )
             elif r.thumbnail_url:
-                out.append(("photo", str(r.thumbnail_url)))
+                out.append({"kind": "photo", "url": str(r.thumbnail_url)})
     elif m.media_type == 2 and m.video_url:
-        out.append(("video", str(m.video_url)))
+        out.append(
+            {
+                "kind": "video",
+                "url": str(m.video_url),
+                "thumb": str(m.thumbnail_url) if m.thumbnail_url else None,
+                "dur": int(round(getattr(m, "video_duration", 0) or 0)),
+            }
+        )
     elif m.thumbnail_url:
-        out.append(("photo", str(m.thumbnail_url)))
+        out.append({"kind": "photo", "url": str(m.thumbnail_url)})
     return out
 
 
 # ---------------- telegram sending ----------------
+IST = timezone(timedelta(hours=5, minutes=30))
+outbox = []  # (posted_ts, items, caption) -> sent in order by sender_job
+send_lock = asyncio.Lock()
+
+
+def make_thumb(raw):
+    """jpeg thumbnail (<=320px) plus original width/height from image bytes"""
+    try:
+        im = Image.open(io.BytesIO(raw)).convert("RGB")
+        w, h = im.size
+        im.thumbnail((320, 320))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=80)
+        return buf.getvalue(), w, h
+    except Exception:
+        return None, 0, 0
+
+
+def vid_kwargs(b):
+    kw = {"supports_streaming": True}
+    if b["dur"]:
+        kw["duration"] = b["dur"]
+    if b["w"]:
+        kw["width"], kw["height"] = b["w"], b["h"]
+    if b["thumb"]:
+        kw["thumbnail"] = b["thumb"]
+    return kw
+
+
 async def send_media(bot, items, caption):
-    caption = caption[:1000]
+    tmo = dict(read_timeout=180, write_timeout=180, connect_timeout=30)
     try:
         blobs = []
         async with httpx.AsyncClient(timeout=90, follow_redirects=True) as h:
-            for kind, url in items[:10]:
-                r = await h.get(url)
+            for it in items[:10]:
+                r = await h.get(it["url"])
                 r.raise_for_status()
                 if len(r.content) > TG_FILE_LIMIT:
                     raise ValueError("file too big")
-                blobs.append((kind, r.content))
+                b = {
+                    "kind": it["kind"],
+                    "data": r.content,
+                    "dur": it.get("dur", 0),
+                    "thumb": None,
+                    "w": 0,
+                    "h": 0,
+                }
+                if it["kind"] == "video" and it.get("thumb"):
+                    try:
+                        tr = await h.get(it["thumb"])
+                        b["thumb"], b["w"], b["h"] = make_thumb(tr.content)
+                    except Exception:
+                        pass
+                blobs.append(b)
         if not blobs:
             raise ValueError("no media")
         if len(blobs) == 1:
-            kind, data = blobs[0]
-            if kind == "video":
+            b = blobs[0]
+            if b["kind"] == "video":
                 await bot.send_video(
-                    OWNER_ID, data, caption=caption, supports_streaming=True
+                    OWNER_ID, b["data"], caption=caption, parse_mode="HTML",
+                    **vid_kwargs(b), **tmo,
                 )
             else:
-                await bot.send_photo(OWNER_ID, data, caption=caption)
+                await bot.send_photo(
+                    OWNER_ID, b["data"], caption=caption, parse_mode="HTML", **tmo
+                )
         else:
             group = []
-            for i, (kind, data) in enumerate(blobs):
+            for i, b in enumerate(blobs):
                 cap = caption if i == 0 else None
-                cls = InputMediaVideo if kind == "video" else InputMediaPhoto
-                group.append(cls(data, caption=cap))
-            await bot.send_media_group(OWNER_ID, group)
+                if b["kind"] == "video":
+                    group.append(
+                        InputMediaVideo(
+                            b["data"], caption=cap, parse_mode="HTML", **vid_kwargs(b)
+                        )
+                    )
+                else:
+                    group.append(
+                        InputMediaPhoto(b["data"], caption=cap, parse_mode="HTML")
+                    )
+            await bot.send_media_group(OWNER_ID, group, **tmo)
     except Exception as e:
-        log.warning("media send failed (%s), sending link only", e)
-        await bot.send_message(OWNER_ID, caption)
+        log.warning("media send failed (%s), sending text only", e)
+        await bot.send_message(OWNER_ID, caption, parse_mode="HTML")
+
+
+async def sender_job(context: ContextTypes.DEFAULT_TYPE):
+    """sends queued notifications one by one, oldest posted first"""
+    if send_lock.locked():
+        return
+    async with send_lock:
+        while outbox:
+            outbox.sort(key=lambda x: x[0])
+            _, items, caption = outbox.pop(0)
+            try:
+                await send_media(context.bot, items, caption)
+            except Exception as e:
+                log.error("send failed: %s", e)
 
 
 def post_link(m):
@@ -183,16 +269,39 @@ def post_link(m):
     return f"https://www.instagram.com/{kind}/{m.code}/"
 
 
+def fmt_time(dt):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST).strftime("%d %b, %I:%M %p IST")
+
+
+def ts_of(dt):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
 async def notify_post(bot, username, m):
     is_reel = getattr(m, "product_type", "") == "clips"
-    head = "🎬 New reel" if is_reel else "📸 New post"
-    cap = f"{head} from @{username}\n\n{(m.caption_text or '')[:600]}\n\n{post_link(m)}"
-    await send_media(bot, media_items(m), cap)
+    head = "🎬 <b>New reel</b>" if is_reel else "📸 <b>New post</b>"
+    text = (m.caption_text or "").strip()
+    if len(text) > 700:
+        text = text[:700] + "…"
+    body = f"\n\n<b>{html.escape(text)}</b>" if text else ""
+    cap = (
+        f"{head} from @{username}{body}\n\n"
+        f"🕒 {fmt_time(m.taken_at)}\n{post_link(m)}"
+    )
+    outbox.append((ts_of(m.taken_at), media_items(m), cap))
 
 
 async def notify_story(bot, username, s):
-    cap = f"👀 New story from @{username}\nhttps://www.instagram.com/stories/{username}/{s.pk}/"
-    await send_media(bot, media_items(s), cap)
+    cap = (
+        f"👀 <b>New story</b> from @{username}\n\n"
+        f"🕒 {fmt_time(s.taken_at)}\n"
+        f"https://www.instagram.com/stories/{username}/{s.pk}/"
+    )
+    outbox.append((ts_of(s.taken_at), media_items(s), cap))
 
 
 def trim(entry):
@@ -523,6 +632,7 @@ def main():
         app.job_queue.run_repeating(feed_job, interval=FEED_SECONDS, first=15)
     app.job_queue.run_repeating(poll_job, interval=FULL_SCAN_SECONDS, first=5)
     app.job_queue.run_repeating(poll_prio_job, interval=PRIO_SECONDS, first=10)
+    app.job_queue.run_repeating(sender_job, interval=3, first=3)
     app.run_polling()
 
 
