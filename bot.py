@@ -32,7 +32,9 @@ PROXY = os.getenv("IG_PROXY", "").strip()
 # fast path: home feed + stories tray (1 call each, covers ALL followed accounts)
 FEED_SECONDS = int(os.getenv("FEED_SECONDS", "25"))
 # slow safety net: per-account full scan (also covers /add accounts you don't follow)
-FULL_SCAN_SECONDS = int(os.getenv("FULL_SCAN_SECONDS", "900"))
+FULL_SCAN_SECONDS = int(os.getenv("FULL_SCAN_SECONDS", "60"))
+# priority accounts (/priority user) are re-checked this often
+PRIO_SECONDS = int(os.getenv("PRIO_SECONDS", "90"))
 
 SESSION_FILE = "session.json"
 DATA_FILE = "data.json"
@@ -47,12 +49,15 @@ for noisy in ("httpx", "instagrapi", "private_request", "public_request"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 cl = Client()
-cl.delay_range = [1, 3]
+cl.delay_range = [0, 1]
 if PROXY:
     cl.set_proxy(PROXY)
 
 poll_lock = asyncio.Lock()
+prio_lock = asyncio.Lock()
 ig_lock = threading.Lock()
+cooldown_until = 0.0
+session_alert_sent = False
 
 
 # ---------------- state ----------------
@@ -317,26 +322,53 @@ async def poll_user(bot, username, entry):
     entry["init"] = True
 
 
-async def poll_job(context: ContextTypes.DEFAULT_TYPE):
-    if state["paused"] or poll_lock.locked():
+async def scan_users(bot, names, lock):
+    global cooldown_until, session_alert_sent
+    if state["paused"] or lock.locked() or time.time() < cooldown_until:
         return
-    async with poll_lock:
-        for username in list(state["users"]):
+    async with lock:
+        for username in names:
+            if time.time() < cooldown_until:
+                break
             entry = state["users"].get(username)
             if not entry:
                 continue
             try:
-                await poll_user(context.bot, username, entry)
+                await poll_user(bot, username, entry)
                 save_state()
+                session_alert_sent = False
             except (PleaseWaitFewMinutes, RateLimitError):
-                log.warning("Rate limited by Instagram, sleeping 5 min")
-                await asyncio.sleep(300)
+                log.warning("Rate limited by Instagram, pausing 5 min")
+                cooldown_until = time.time() + 300
+                break
+            except LoginRequired:
+                log.error("Instagram session dead (login_required)")
+                cooldown_until = time.time() + 600
+                if not session_alert_sent:
+                    session_alert_sent = True
+                    await bot.send_message(
+                        OWNER_ID,
+                        "⚠️ Instagram session expire ho gaya (login_required).\n"
+                        "Browser se naya sessionid lo, VPS par .env mein IG_SESSIONID badlo, "
+                        "phir: sudo systemctl restart igbot",
+                    )
                 break
             except UserNotFound:
                 log.warning("User not found: %s", username)
             except Exception as e:
-                log.exception("poll error for %s: %s", username, e)
-            await asyncio.sleep(random.uniform(1.5, 3.5))
+                log.error("poll error for %s: %s", username, e)
+            await asyncio.sleep(random.uniform(0.4, 1.0))
+
+
+async def poll_job(context: ContextTypes.DEFAULT_TYPE):
+    names = [u for u, e in state["users"].items() if not e.get("prio")]
+    await scan_users(context.bot, names, poll_lock)
+
+
+async def poll_prio_job(context: ContextTypes.DEFAULT_TYPE):
+    names = [u for u, e in state["users"].items() if e.get("prio")]
+    if names:
+        await scan_users(context.bot, names, prio_lock)
 
 
 # ---------------- commands (owner only) ----------------
@@ -391,11 +423,40 @@ async def cmd_remove(update: Update, context):
     await update.message.reply_text("\n".join(msgs) or "Use: /remove username")
 
 
+async def cmd_priority(update: Update, context):
+    if not context.args:
+        return await update.message.reply_text("Use: /priority user1 user2  (har ~90s check)")
+    msgs = []
+    for raw in context.args:
+        u = clean(raw)
+        e = state["users"].get(u)
+        if not e:
+            msgs.append(f"• @{u} list me nahi hai (pehle /add karo)")
+            continue
+        e["prio"] = True
+        msgs.append(f"⭐ @{u} priority me")
+    save_state()
+    await update.message.reply_text("\n".join(msgs))
+
+
+async def cmd_unpriority(update: Update, context):
+    msgs = []
+    for raw in context.args:
+        u = clean(raw)
+        e = state["users"].get(u)
+        if e and e.pop("prio", None):
+            msgs.append(f"@{u} normal me wapas")
+    save_state()
+    await update.message.reply_text("\n".join(msgs) or "Use: /unpriority user")
+
+
 async def cmd_list(update: Update, context):
-    names = sorted(state["users"])
+    names = sorted(state["users"], key=lambda n: (not state["users"][n].get("prio"), n))
     if not names:
         return await update.message.reply_text("List khaali hai. /add ya /import use karo.")
-    text = f"Watching {len(names)} accounts:\n" + "\n".join(f"@{n}" for n in names)
+    text = f"Watching {len(names)} accounts (⭐ = priority):\n" + "\n".join(
+        f"{'⭐' if state['users'][n].get('prio') else ''}@{n}" for n in names
+    )
     for i in range(0, len(text), 4000):
         await update.message.reply_text(text[i : i + 4000])
 
@@ -436,8 +497,8 @@ async def cmd_status(update: Update, context):
     await update.message.reply_text(
         f"Accounts: {len(state['users'])} (ready: {ready})\n"
         f"Paused: {state['paused']}\n"
-        f"Fast check: har {FEED_SECONDS}s (feed + stories)\n"
-        f"Full scan: har {FULL_SCAN_SECONDS}s"
+        f"Priority accounts: {sum(1 for e in state['users'].values() if e.get('prio'))} (har {PRIO_SECONDS}s)\n"
+        f"Fast feed path: {'ON' if os.getenv('FAST_PATH', '0') == '1' else 'OFF'}"
     )
 
 
@@ -453,10 +514,15 @@ def main():
         ("pause", cmd_pause),
         ("resume", cmd_resume),
         ("status", cmd_status),
+        ("priority", cmd_priority),
+        ("unpriority", cmd_unpriority),
     ]:
         app.add_handler(CommandHandler(name, fn, filters=owner))
-    app.job_queue.run_repeating(feed_job, interval=FEED_SECONDS, first=15)
+    # NOTE: fast path (home feed/tray) kills the session on this setup -> off by default
+    if os.getenv("FAST_PATH", "0") == "1":
+        app.job_queue.run_repeating(feed_job, interval=FEED_SECONDS, first=15)
     app.job_queue.run_repeating(poll_job, interval=FULL_SCAN_SECONDS, first=5)
+    app.job_queue.run_repeating(poll_prio_job, interval=PRIO_SECONDS, first=10)
     app.run_polling()
 
 
