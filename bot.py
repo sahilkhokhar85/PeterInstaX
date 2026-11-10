@@ -748,7 +748,7 @@ async def poll_one_account(bot, username, entry, do_stories: bool):
             continue
         await notify_post(bot, username, m)
 
-    if do_stories:
+    if do_stories or first_run:  # first run: also mark live stories as seen
         stories = await asyncio.to_thread(ig_fetch_stories, entry["id"])
         for s in sorted(stories, key=lambda x: x.taken_at):
             sid = str(s.pk)
