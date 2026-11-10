@@ -121,6 +121,7 @@ PRIO_SECONDS = int(os.getenv("PRIO_SECONDS", "90"))
 
 SCAN_GAP_MIN = float(os.getenv("SCAN_GAP_MIN", "3"))     # jitter between accounts, seconds
 SCAN_GAP_MAX = float(os.getenv("SCAN_GAP_MAX", "7"))
+SEND_BUFFER = int(os.getenv("SEND_BUFFER", "45"))  # seconds to hold notifications so they go out in posted-time order
 STORY_EVERY = int(os.getenv("STORY_EVERY", "3"))         # check an account's stories every Nth round (posts checked every round)
 
 # "HH:MM-HH:MM" in QUIET_TZ (default IST) - polling pauses during this window each day.
@@ -537,9 +538,15 @@ async def sender_job(context):
     if send_lock.locked():
         return
     async with send_lock:
-        while outbox:
-            outbox.sort(key=lambda x: x[0])
-            _, items, caption = outbox.pop(0)
+        while True:
+            now = time.time()
+            ready = [x for x in outbox if now - x[3] >= SEND_BUFFER]
+            if not ready:
+                break
+            ready.sort(key=lambda x: x[0])
+            first = ready[0]
+            outbox.remove(first)
+            _, items, caption, _enq = first
             try:
                 await send_media(context.bot, items, caption)
             except Exception as e:
@@ -571,13 +578,13 @@ async def notify_post(bot, username, m):
         text = text[:700] + "…"
     body = f"\n\n<b>{html.escape(text)}</b>" if text else ""
     cap = f"{head} from @{username}{body}\n\n🕒 {fmt_time(m.taken_at)}\n{post_link(m)}"
-    outbox.append((ts_of(m.taken_at), media_items(m), cap))
+    outbox.append((ts_of(m.taken_at), media_items(m), cap, time.time()))
 
 
 async def notify_story(bot, username, s):
     cap = (f"👀 <b>New story</b> from @{username}\n\n🕒 {fmt_time(s.taken_at)}\n"
            f"https://www.instagram.com/stories/{username}/{s.pk}/")
-    outbox.append((ts_of(s.taken_at), media_items(s), cap))
+    outbox.append((ts_of(s.taken_at), media_items(s), cap, time.time()))
 
 
 def trim(entry):
@@ -1054,7 +1061,13 @@ def main():
     from telegram.ext import Application, CommandHandler, filters
 
     cl = _build_client()
-    ig_login(interactive=False)
+    try:
+        ig_login(interactive=False)
+    except RuntimeError as e:
+        # exit code 3 = do NOT auto-restart (systemd RestartPreventExitStatus=3),
+        # otherwise a dead session would be re-checked against Instagram every restart
+        log.error("%s", e)
+        sys.exit(3)
 
     app = Application.builder().token(BOT_TOKEN).build()
     owner = filters.User(OWNER_ID)
